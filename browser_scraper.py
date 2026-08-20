@@ -114,26 +114,62 @@ def scrape_gdrive_transcript(file_id: str) -> str:
 
         print("    [1/3] Activating video player and starting playback...")
 
-        # Deterministically start muted playback (autoplay policies otherwise
-        # block it, and Drive only requests the caption stream once playing).
+        # Drive only requests the caption (timedtext) stream while the video is
+        # actually playing, so we must get real playback going. Wait for the
+        # <video> element to appear, then force muted autoplay.
         try:
-            page.evaluate("""() => {
-                const v = document.querySelector('video');
-                if (v) {
-                    v.muted = true;
-                    const p = v.play();
-                    if (p && p.catch) p.catch(() => {});
-                    return true;
-                }
-                return false;
-            }""")
-            time.sleep(2)
+            started = page.evaluate("""() => new Promise((resolve) => {
+                let tries = 12;
+                const attempt = () => {
+                    const v = document.querySelector('video');
+                    if (v) {
+                        v.muted = true;
+                        const p = v.play();
+                        if (p && p.catch) p.catch(() => {});
+                        resolve(true);
+                    } else if (tries-- > 0) {
+                        setTimeout(attempt, 500);
+                    } else {
+                        resolve(false);
+                    }
+                };
+                attempt();
+            })""")
+            print(f"    [1/3] Video element present: {started}")
         except Exception as e:
             print(f"    [1/3] play() notice: {e}")
 
+        time.sleep(3)
+
+        # If playback is still paused (player sometimes needs a click to
+        # activate), toggle the video WITHOUT pausing it if already playing.
         try:
-            page.mouse.click(700, 450)
-            time.sleep(1)
+            was_paused = page.evaluate("() => { const v = document.querySelector('video'); return v ? v.paused : true; }")
+            if was_paused:
+                page.mouse.click(700, 450)
+                time.sleep(2)
+                page.evaluate("""() => {
+                    const v = document.querySelector('video');
+                    if (v) {
+                        v.muted = true;
+                        const p = v.play();
+                        if (p && p.catch) p.catch(() => {});
+                    }
+                }""")
+                time.sleep(2)
+        except Exception:
+            pass
+
+        # Nudge playback a few seconds forward — this reliably forces Drive to
+        # request the caption track if it hasn't fired yet.
+        try:
+            page.evaluate("""() => {
+                const v = document.querySelector('video');
+                if (v && v.readyState > 0 && v.duration > 0) {
+                    v.currentTime = Math.min(v.currentTime + 3, v.duration - 1);
+                }
+            }""")
+            time.sleep(2)
         except Exception:
             pass
 
