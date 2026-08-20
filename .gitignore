@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Secrets / credentials (NEVER commit)
+.env
+cookies.txt
+browser_profile/
+config_local.py
+
+# Runtime data (personal transcripts, media, reports)
+transcripts/
+audio/
+downloads/
+reports/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log

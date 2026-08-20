@@ -1,0 +1,7 @@
+groq
+gdown
+pydub
+tiktoken
+playwright
+yt-dlp
+openai
