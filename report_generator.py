@@ -629,6 +629,19 @@ def _extract_chapters(text: str, seg_start_sec: int, seg_end_sec: int) -> list:
             cur = {'start': start, 'end': end, 'title': title, 'body': []}
         else:
             if cur is not None:
+                stripped = line.strip()
+                # Drop LLM meta-reasoning that leaks between chapters (e.g.
+                # "Then we need to cover 22:57-23:03. Since there is no dialogue..."
+                # or "Maybe we can make a chapter from 22:52 to 22:52?"). Real
+                # chapter content is bullet/bold-structured or an indented
+                # continuation; unindented prose paragraphs are reasoning.
+                if not stripped:
+                    continue
+                is_bullet = stripped.startswith(('-', '*', '>'))
+                is_header = stripped.startswith('###')
+                is_continuation = line[:1].isspace()
+                if not (is_bullet or is_header or is_continuation):
+                    continue
                 cur['body'].append(line)
 
     if cur is not None and cur['body']:
@@ -981,7 +994,9 @@ def generate_report(transcript_text: str, file_id: str) -> str:
                             f"[{g_start} – {g_end}] with chapters for every question/topic exchange "
                             f"in that range, using the REAL timestamps from this excerpt. "
                             f"Start directly with a '### [MM:SS – MM:SS] — Title' header.\n\n"
-                            f"GAP TRANSCRIPT EXCERPT [{g_start} – {g_end}]:\n{gap_text}"
+                            f"GAP TRANSCRIPT EXCERPT [{g_start} – {g_end}]:\n{gap_text}\n\n"
+                            f"Output ONLY the chapter markdown blocks. Do NOT include any commentary, "
+                            f"reasoning, explanations, or meta-discussion between or after the chapters."
                         )
                         digest = router.call(
                             messages=[
