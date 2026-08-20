@@ -637,6 +637,10 @@ def _extract_chapters(text: str, seg_start_sec: int, seg_end_sec: int) -> list:
                 # continuation; unindented prose paragraphs are reasoning.
                 if not stripped:
                     continue
+                # Skip pure horizontal-rule lines ('---', '***', '___') that the
+                # model sometimes emits as chapter separators; they are not content.
+                if re.fullmatch(r'[-*_]{3,}', stripped):
+                    continue
                 is_bullet = stripped.startswith(('-', '*', '>'))
                 is_header = stripped.startswith('###')
                 is_continuation = line[:1].isspace()
@@ -765,6 +769,34 @@ def _extract_range_text(segment_text: str, start_sec: int, end_sec: int) -> str:
     return "\n".join(out)
 
 
+def _chapter_truncated(ch: dict) -> bool:
+    """True when a chapter body looks cut off (digest hit its token cap mid-bullet).
+
+    Fingerprints: an empty body, a body ending in a horizontal rule, a line
+    ending in an unclosed double-quote, or a final line lacking sentence-ending
+    punctuation. Complete Auditor Notes lines end with '.', so anything else is
+    a truncation signal worth re-digesting in isolation.
+    """
+    lines = [l.strip() for l in ch.get('body', []) if l.strip()]
+    if not lines:
+        return True
+    last = lines[-1]
+    if last.endswith('"'):
+        return last.count('"') % 2 == 1
+    if re.search(r'[.!?:)\]…]$', last):
+        return False
+    return True
+
+
+def _truncated_ranges(chapters: list) -> list:
+    """Return [(start, end)] for chapters whose body was cut off mid-writing."""
+    out = []
+    for c in chapters:
+        if c['start'] is not None and _chapter_truncated(c):
+            out.append((c['start'], c['end']))
+    return out
+
+
 def _merge_chapters(primary: list, extra: list, seg_start_sec: int, seg_end_sec: int) -> list:
     """Merge gap-filled chapters into the primary list, dropping overlaps and
     re-validating order/range exactly like _extract_chapters."""
@@ -835,6 +867,16 @@ def _has_required_sections(text: str) -> list:
         if name.lower() not in text.lower():
             missing.append(name)
     return missing
+
+
+def _has_malformed_table(text: str) -> bool:
+    """True when a markdown table row is truncated mid-row (starts with '|' but
+    never closes), which signals the synthesis hit its token cap mid-table."""
+    for line in text.split('\n'):
+        stripped = line.strip()
+        if stripped.startswith('|') and not stripped.endswith('|'):
+            return True
+    return False
 
 
 def _splice_missing_sections(report_text: str, sections_text: str) -> str:
@@ -962,6 +1004,16 @@ def generate_report(transcript_text: str, file_id: str) -> str:
             coverage = _chapter_coverage(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
             largest_gap = max((e - s for s, e in gaps), default=0)
             uncovered_dialogue = sum(e - s for s, e in gaps)
+            # A truncated chapter body (digest cut mid-bullet by the token cap)
+            # is content loss even when its time range is technically covered —
+            # e.g. an empty body or a chapter ending '- **Disc'. Re-digest those
+            # ranges in isolation just like uncovered gaps.
+            trunc_ranges = _truncated_ranges(chapters)
+            gaps += [(s, e) for s, e in trunc_ranges if e is not None and e > s]
+            gaps.sort()
+            if trunc_ranges:
+                print(f"        [WARN] Segment {i}: {len(trunc_ranges)} chapter(s) truncated "
+                      f"(digest cut mid-body) — re-digesting in isolation...")
             # Under-production (model stops early) is the most common silent
             # failure: chapters legitimately cover what they do cover, but the
             # last chapter ends long before the segment's actual dialogue does.
@@ -976,7 +1028,7 @@ def generate_report(transcript_text: str, file_id: str) -> str:
             tail_miss = last_turn - last_chapter_end
             seg_duration = max(1, seg_end_sec - seg_start_sec)
             tail_threshold = max(45, int(seg_duration * 0.12))
-            if gaps and (coverage < 0.75 or largest_gap > 180 or uncovered_dialogue > 120 or tail_miss > tail_threshold):
+            if gaps and (coverage < 0.75 or largest_gap > 180 or uncovered_dialogue > 120 or tail_miss > tail_threshold or trunc_ranges):
                 print(f"    [WARN] Segment {i}: chapters cover only {coverage:.0%} of dialogue "
                       f"(largest gap {largest_gap // 60}m{largest_gap % 60:02d}s, "
                       f"{len(gaps)} uncovered range(s)) — gap-filling...")
@@ -1040,6 +1092,58 @@ def generate_report(transcript_text: str, file_id: str) -> str:
                             print(f"        [OK] Segment {i}: {len(chapters)} chapters (coverage improved)")
                 except Exception as e:
                     print(f"        [WARN] Segment {i}: coverage retry failed ({str(e)[:60]}) — keeping current chapters")
+
+            # Post-merge truncation sweep: gap-filled digest output can itself be
+            # cut mid-bullet (it shares the same token cap). Re-digest any range
+            # that still ends truncated, in isolation, so bodies land complete.
+            still_trunc = _truncated_ranges(chapters)
+            if still_trunc:
+                print(f"        [WARN] Segment {i}: {len(still_trunc)} chapter(s) still truncated after "
+                      f"gap-fill — final re-digest...")
+                time.sleep(CALL_COOLDOWN_SECS)
+                try:
+                    extra = []
+                    for gs, ge in still_trunc:
+                        gap_text = _extract_range_text(s['text'], gs, ge)
+                        if not gap_text.strip():
+                            continue
+                        g_start = f"{gs // 60:02d}:{gs % 60:02d}"
+                        g_end = f"{ge // 60:02d}:{ge % 60:02d}"
+                        gap_prompt = (
+                            f"A previous chapter covering [{g_start} – {g_end}] was cut off mid-writing. "
+                            f"Rewrite ONLY that chapter (same title, same range) COMPLETE, with every bullet "
+                            f"fully written and ending in punctuation. Use the REAL timestamps from this "
+                            f"excerpt. Start directly with a '### [MM:SS – MM:SS] — Title' header.\n\n"
+                            f"GAP TRANSCRIPT EXCERPT [{g_start} – {g_end}]:\n{gap_text}\n\n"
+                            f"Output ONLY the chapter markdown block. Do NOT include any commentary, "
+                            f"reasoning, explanations, or meta-discussion."
+                        )
+                        digest = router.call(
+                            messages=[
+                                {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
+                                {"role": "user", "content": gap_prompt}
+                            ],
+                            max_tokens=2200,
+                            temperature=0.0,
+                            allow_tpm_wait=True,
+                            is_synthesis=False
+                        )
+                        extra.extend(_extract_chapters(digest, gs, ge))
+                    if extra:
+                        # Drop the truncated chapters that the fresh re-digest now
+                        # re-covers, so stale cut-off bodies don't linger next to
+                        # their complete replacements.
+                        covered = [(s, e) for s, e in still_trunc]
+                        chapters = [c for c in chapters
+                                    if c['start'] is not None
+                                    and not any(s <= c['start'] and (c['end'] or seg_end_sec) <= e
+                                                for s, e in covered)]
+                        chapters = _merge_chapters(chapters, extra, seg_start_sec, seg_end_sec)
+                        remaining = _truncated_ranges(chapters)
+                        print(f"        [OK] Segment {i}: truncation sweep done, "
+                              f"{len(remaining)} still truncated, {len(chapters)} chapters total")
+                except Exception as e:
+                    print(f"        [WARN] Segment {i}: truncation sweep failed ({str(e)[:60]}) — keeping current chapters")
 
         if chapters:
             segment_digests.append(_serialize_chapters(chapters))
@@ -1123,6 +1227,9 @@ def generate_report(transcript_text: str, file_id: str) -> str:
         missing = REQUIRED_SECTIONS
     else:
         missing = _has_required_sections(synthesis_result)
+        if _has_malformed_table(synthesis_result):
+            print("    [WARN] Synthesis output has a truncated/malformed table row — retrying...")
+            missing = missing + ["complete table rows"]
     if missing:
         print(f"    [WARN] Synthesis missing sections: {', '.join(missing)} — retrying once...")
         time.sleep(CALL_COOLDOWN_SECS)
