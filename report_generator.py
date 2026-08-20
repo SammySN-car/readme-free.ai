@@ -233,7 +233,14 @@ class ModelRouter:
                             max_tokens=max_tokens,
                             timeout=90.0,
                         )
-                        raw_content = response.choices[0].message.content or ""
+                        try:
+                            raw_content = response.choices[0].message.content or ""
+                        except (TypeError, IndexError, AttributeError):
+                            # Free models occasionally return a malformed response
+                            # (choices=None / empty) instead of raising. Treat it
+                            # as an empty reply and rotate to the next model.
+                            print(f"        [SKIP] [{short}] Malformed response (empty choices), trying next...")
+                            break
                         if raw:
                             content = raw_content.strip()
                         else:
@@ -989,7 +996,7 @@ def generate_report(transcript_text: str, file_id: str) -> str:
                         extra.extend(_extract_chapters(digest, gs, ge))
                     if extra:
                         chapters = _merge_chapters(chapters, extra, seg_start_sec, seg_end_sec)
-                        new_cov = _chapter_coverage(chapters, seg_start_sec, seg_end_sec)
+                        new_cov = _chapter_coverage(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
                         print(f"        [OK] Segment {i}: {len(chapters)} chapters, "
                               f"coverage {new_cov:.0%} (gap-filled)")
                     else:
@@ -1013,7 +1020,7 @@ def generate_report(transcript_text: str, file_id: str) -> str:
                             is_synthesis=False
                         )
                         retry_chapters = _extract_chapters(digest, seg_start_sec, seg_end_sec)
-                        if _chapter_coverage(retry_chapters, seg_start_sec, seg_end_sec) > coverage:
+                        if _chapter_coverage(retry_chapters, seg_start_sec, seg_end_sec, seg_dialogue) > coverage:
                             chapters = retry_chapters
                             print(f"        [OK] Segment {i}: {len(chapters)} chapters (coverage improved)")
                 except Exception as e:
