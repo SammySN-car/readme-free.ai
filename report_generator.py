@@ -946,13 +946,17 @@ def generate_report(transcript_text: str, file_id: str) -> str:
             # failure: chapters legitimately cover what they do cover, but the
             # last chapter ends long before the segment's actual dialogue does.
             # Trigger gap-fill when >25% of real dialogue is uncovered, when any
-            # single gap exceeds 3 min, or when the final chapter ends >90s
-            # before the last dialogue turn.
+            # single gap exceeds 3 min, or when the final chapter ends well before
+            # the last dialogue turn. The tail threshold scales with session
+            # length so short recordings (e.g. 7 min) don't lose their closing
+            # remarks (a fixed 90s bound lets ~16% of a short session vanish).
             last_turn = seg_dialogue[-1][1] if seg_dialogue else seg_end_sec
             last_chapter_end = max((c['end'] or seg_end_sec) for c in chapters if c['start'] is not None) \
                 if chapters else seg_start_sec
             tail_miss = last_turn - last_chapter_end
-            if gaps and (coverage < 0.75 or largest_gap > 180 or uncovered_dialogue > 120 or tail_miss > 90):
+            seg_duration = max(1, seg_end_sec - seg_start_sec)
+            tail_threshold = max(45, int(seg_duration * 0.12))
+            if gaps and (coverage < 0.75 or largest_gap > 180 or uncovered_dialogue > 120 or tail_miss > tail_threshold):
                 print(f"    [WARN] Segment {i}: chapters cover only {coverage:.0%} of dialogue "
                       f"(largest gap {largest_gap // 60}m{largest_gap % 60:02d}s, "
                       f"{len(gaps)} uncovered range(s)) — gap-filling...")
