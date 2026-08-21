@@ -917,6 +917,100 @@ def _has_malformed_table(text: str) -> bool:
     return False
 
 
+def _ends_abruptly(block_body: str) -> bool:
+    """True when a section body's last non-empty line looks cut off mid-content.
+
+    Detects the token-cap signature that table checks miss: a numbered/bulleted
+    list item or sentence that stops without terminal punctuation (e.g.
+    '10. **\"what is the output range of rel'), or unbalanced bold/quote markers.
+    Skips trailing separator lines ('---') since they are structural, not content.
+    """
+    lines = [l.strip() for l in block_body.rstrip().split('\n') if l.strip()]
+    if not lines:
+        return False
+    # Skip trailing separator lines to reach the last real content line.
+    while lines and lines[-1] in ('---', '***', '___'):
+        lines.pop()
+    if not lines:
+        return False
+    last = lines[-1]
+    if last.startswith('##'):
+        return True  # header with no body beneath it
+    if last.count('**') % 2 != 0 or last.count('"') % 2 != 0:
+        return True
+    # Terminal punctuation / natural closers mean the line finished.
+    if re.search(r'[\.\?!:;\|\)]\s*$', last):
+        return False
+    # Short fragments (e.g. '- **Candidate 1**') are not evidence of truncation.
+    if len(last) <= 15:
+        return False
+    return True
+
+
+def _iter_required_section_blocks(text: str):
+    """Yield (name, start, end) spans for every required section present."""
+    for name in REQUIRED_SECTIONS:
+        pattern = re.compile(
+            rf'^##\s*[^\n]*{re.escape(name)}[^\n]*\n.*?(?=^##\s|\Z)',
+            flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
+        )
+        m = pattern.search(text)
+        if m:
+            yield name, m.start(), m.end()
+
+
+def _repair_truncated_sections(router, synthesis_result: str, grounding: str,
+                                synthesis_context: str) -> str:
+    """Regenerate any required section whose body was cut off mid-content by the
+    output-token cap, replacing it in place with a freshly generated block.
+
+    Uses regex-based replacement (not index-based) so repairing one section
+    doesn't shift indices for subsequent sections."""
+    for name in REQUIRED_SECTIONS:
+        original_block = _extract_section_block(synthesis_result, name)
+        if not original_block:
+            continue
+        body = original_block.split('\n', 1)[1] if '\n' in original_block else ''
+        if not _ends_abruptly(body):
+            continue
+        print(f"    [WARN] '{name}' appears cut off mid-content — regenerating just this section...")
+        time.sleep(CALL_COOLDOWN_SECS)
+        template = (
+            f"The '{name}' section in your previous output was CUT OFF mid-content by a length limit.\n\n"
+            f"Regenerate ONLY the complete '{name}' section, in the exact same Markdown style and with "
+            "the exact '## ...' header as the full report. Output ONLY that section — no preamble, no "
+            "other sections, no planning text.\n\n"
+            "Use the GROUNDING EXCERPT for exact timestamps/quotes and the CHAPTER DIGESTS for the "
+            "full-session narrative.\n\n"
+            "GROUNDING EXCERPT:\n{grounding}\n\n"
+            "CHAPTER DIGESTS:\n{window_summaries}"
+        )
+        prompt, mt = _build_synthesis_call(SYNTHESIS_SYSTEM_PROMPT, template, grounding, synthesis_context)
+        try:
+            fresh = router.call(
+                messages=[
+                    {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=mt,
+                temperature=0.0,
+                allow_tpm_wait=True,
+                is_synthesis=True,
+                raw=True,
+            )
+        except Exception as exc:
+            print(f"        [WARN] Section repair failed ({str(exc)[:80]}) — keeping original")
+            continue
+        fresh_block = _extract_section_block(fresh, name)
+        fresh_body = fresh_block.split('\n', 1)[1] if '\n' in fresh_block else ''
+        if not fresh_block or _ends_abruptly(fresh_body):
+            print("        [WARN] Regenerated section also incomplete — keeping original")
+            continue
+        synthesis_result = synthesis_result.replace(original_block, fresh_block, 1)
+        print(f"        [OK] '{name}' repaired ({len(fresh_block)} chars)")
+    return synthesis_result
+
+
 def _splice_missing_sections(report_text: str, sections_text: str) -> str:
     """Insert generated missing sections before the chronological-chapters anchor
     (or append at the end if that anchor is absent), preserving the doc structure."""
@@ -1268,6 +1362,11 @@ def generate_report(transcript_text: str, file_id: str) -> str:
         if _has_malformed_table(synthesis_result):
             print("    [WARN] Synthesis output has a truncated/malformed table row — retrying...")
             missing = missing + ["complete table rows"]
+        # Repair sections cut off mid-content by the token cap (e.g. the last
+        # numbered question ending mid-sentence). This catches truncation inside
+        # a section that _has_required_sections can't see.
+        synthesis_result = _repair_truncated_sections(
+            router, synthesis_result, grounding, synthesis_context)
     if missing:
         print(f"    [WARN] Synthesis missing sections: {', '.join(missing)} — retrying once...")
         time.sleep(CALL_COOLDOWN_SECS)
