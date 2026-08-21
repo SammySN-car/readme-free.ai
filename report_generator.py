@@ -344,7 +344,13 @@ SEGMENT_SYSTEM_PROMPT = (
     "acknowledgments ('Yes sir.', 'Okay.') and no Q&A, still emit a SHORT chapter for it — describe in "
     "the Auditor Notes that it was acknowledgment-only, never claim 'no substantive discussion' for a "
     "span that actually contains questions or explanations.\n"
-    "5. Aim for several short chapters rather than one long one when the segment spans multiple topics."
+    "5. Aim for several short chapters rather than one long one when the segment spans multiple topics.\n\n"
+    "EXAMPLE CHAPTER (format only — never copy this sample content, use the real transcript):\n\n"
+    "### [02:44 - 03:01] — Candidate Introduction Request\n"
+    "- **Discussion & Events:** The examiner asked the candidate to introduce himself briefly before the technical questions began.\n"
+    "- **Key Topics & Q&A:** Q: \"Can you give a short intro about yourself?\" — Candidate responded with his name and project title.\n"
+    "- **Auditor Notes:** Confident delivery; no screen sharing during this exchange.\n\n"
+    "Your ENTIRE reply must be chapters in exactly this shape — no planning text, no explanations."
 )
 
 
@@ -405,6 +411,38 @@ Markdown table | Topic / Concept | Evaluated Candidate | Competency Level | Rati
 ## 🎯 TA & Instructor Audit Notes
 - **Candidate N Audit Notes:** specific flags, hesitations, disputed answers, live-coding observations, gaps, confidence.
 - **Overall Recommendation:** recommendation based on the actual performance evidence in the transcript.
+
+MINIATURE FORMAT EXAMPLE (structure only — replace ALL content with real data from the inputs above; never copy this sample text):
+
+## ⚡ Executive Summary (For TAs & Mentors)
+**Session Overview:** A 35-minute viva evaluated 1 candidate on ML fundamentals and live coding.
+### 📌 Participant Breakdown & Core Highlights:
+- **Candidate 1:** evaluated on LSTM/GRU theory and a zero-shot pipeline; strong explanations, hesitant while coding live.
+- **Examiner / Instructor:** guided the demo and probed follow-ups.
+---
+## ⏱️ Assigned Action Items & Next Steps
+| Timestamp | Assignee | Action |
+|-----------|----------|--------|
+| [02:41] | Candidate 1 | Give a short self-introduction as requested. |
+---
+## 📊 Performance Scorecard & Evaluation Rubric
+| Candidate / Metric | Score / Verdict | Benchmark Status | Examiner Notes |
+|-------------------|-----------------|------------------|----------------|
+| Overall Rating | 7.5/10 (Merit) | On track | Confident theory, slower execution. |
+---
+## 🎯 Topic Competency Matrix
+| Topic / Concept | Evaluated Candidate | Competency Level | Rating (/10) | Auditor / Examiner Notes |
+|-----------------|---------------------|------------------|--------------|--------------------------|
+| LSTM vs GRU | Candidate 1 | Proficient | 8 | Explained gates clearly. |
+---
+## ❓ Key Technical Questions & Verdicts
+1. **"What are the key learnings in your project?"** (Asked to: Candidate 1) — *Result: ✅ Correct*: clear, structured answer.
+---
+## 🎯 TA & Instructor Audit Notes
+- **Candidate 1 Audit Notes:** minor hesitations during live coding; otherwise confident.
+- **Overall Recommendation:** Pass with merit.
+
+Begin your reply NOW with '## ⚡ Executive Summary (For TAs & Mentors)' using the REAL transcript data.
 """
 
 SYNTHESIS_SYSTEM_PROMPT = (
