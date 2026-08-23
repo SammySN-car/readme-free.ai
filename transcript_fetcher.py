@@ -1,10 +1,10 @@
 import os
-import json
 import urllib.request
 import xml.etree.ElementTree as ET
 from config import TRANSCRIPTS_DIR, google_profile_ready
 from gdrive_downloader import download_from_gdrive, extract_file_id
 from audio_extractor import extract_audio_from_video
+from timedtext import parse as parse_timedtext_json
 
 
 def fetch_transcript_from_gdrive(file_id_or_url: str) -> dict:
@@ -45,7 +45,7 @@ def fetch_transcript_from_gdrive(file_id_or_url: str) -> dict:
             # If it's a raw JSON file, parse it automatically into clean formatted text
             if content.startswith("{") and "events" in content:
                 print(f"[Cache] Found raw Google TimedText JSON in cache: parsing dialogue...")
-                parsed = _parse_timedtext_json_content(content)
+                parsed = parse_timedtext_json(content)
                 if parsed:
                     content = parsed
                     with open(cache_txt, "w", encoding="utf-8") as f:
@@ -167,7 +167,7 @@ def _try_timedtext_endpoint(file_id: str) -> str:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 content = resp.read().decode("utf-8")
                 if "events" in content:
-                    parsed = _parse_timedtext_json_content(content)
+                    parsed = parse_timedtext_json(content)
                     if parsed:
                         return parsed
                 elif "<transcript>" in content or "<text" in content:
@@ -185,47 +185,6 @@ def _try_timedtext_endpoint(file_id: str) -> str:
         except Exception:
             continue
     return None
-
-
-def _parse_timedtext_json_content(raw_json_str: str) -> str:
-    """Parse Google TimedText JSON structure into clean chronological dialogue turns."""
-    try:
-        data = json.loads(raw_json_str)
-        events = data.get("events", [])
-        dialogue_turns = []
-        current_time = "00:00"
-        current_words = []
-
-        for ev in events:
-            t_ms = ev.get("tStartMs", 0)
-            mins = int(t_ms // 60000)
-            secs = int((t_ms % 60000) // 1000)
-            timestamp = f"{mins:02d}:{secs:02d}"
-
-            segs = ev.get("segs", [])
-            text = "".join(s.get("utf8", "") for s in segs)
-            text = text.replace("\n", " ").strip()
-            if not text:
-                continue
-
-            if text.startswith(">>"):
-                if current_words:
-                    dialogue_turns.append(f"[{current_time}] {' '.join(current_words)}")
-                    current_words = []
-                current_time = timestamp
-                text = text[2:].strip()
-                current_words.append(text)
-            else:
-                if not current_words:
-                    current_time = timestamp
-                current_words.append(text)
-
-        if current_words:
-            dialogue_turns.append(f"[{current_time}] {' '.join(current_words)}")
-
-        return "\n\n".join(dialogue_turns)
-    except Exception:
-        return None
 
 
 def _save_transcript(file_id: str, text: str):
