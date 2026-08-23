@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import urllib.parse
 from config import BROWSER_PROFILE_DIR, TRANSCRIPTS_DIR, google_profile_ready
 from timedtext import parse as parse_timedtext_json
