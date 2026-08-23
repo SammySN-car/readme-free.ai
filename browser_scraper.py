@@ -2,15 +2,7 @@ import os
 import time
 import json
 import urllib.parse
-from config import BROWSER_PROFILE_DIR, TRANSCRIPTS_DIR
-
-
-def _profile_ready() -> bool:
-    """True if an authenticated browser profile already exists (user ran --login)."""
-    return os.path.isdir(BROWSER_PROFILE_DIR) and any(
-        os.path.exists(os.path.join(BROWSER_PROFILE_DIR, name))
-        for name in ("Default", "Local State", "Cookies")
-    )
+from config import BROWSER_PROFILE_DIR, TRANSCRIPTS_DIR, google_profile_ready
 
 
 def login_to_google():
@@ -73,7 +65,7 @@ def scrape_gdrive_transcript(file_id: str) -> str:
     """
     from playwright.sync_api import sync_playwright
 
-    if not _profile_ready():
+    if not google_profile_ready():
         print("\n[ℹ️ Browser Scraper] Skipped — no authenticated browser profile found.")
         print("    Run `python analyzer.py --login` once to sign in, then retry this file.")
         return None

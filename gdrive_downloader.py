@@ -11,7 +11,7 @@ import os
 import re
 import time
 import gdown
-from config import DOWNLOADS_DIR, BROWSER_PROFILE_DIR
+from config import DOWNLOADS_DIR, BROWSER_PROFILE_DIR, google_profile_ready
 
 
 def extract_file_id(url: str) -> str:
@@ -92,7 +92,7 @@ def download_from_gdrive(gdrive_url: str, output_filename: str = None) -> str:
         print(f"[Download] Public download notice: {e}")
 
     # Attempt 2: Authenticated Playwright Browser Download (requires --login)
-    if not (os.path.isdir(BROWSER_PROFILE_DIR) and os.path.exists(os.path.join(BROWSER_PROFILE_DIR, "Default"))):
+    if not google_profile_ready():
         raise PermissionError(
             "The file is not publicly downloadable. Run `python analyzer.py --login` once to "
             "authenticate your Google account, then retry this link."
@@ -144,7 +144,3 @@ def download_from_gdrive(gdrive_url: str, output_filename: str = None) -> str:
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"[Auth Download] Complete! File size: {size_mb:.1f} MB")
     return output_path
-
-
-# Alias for backward compatibility
-download_gdrive_video = download_from_gdrive

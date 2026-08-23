@@ -63,13 +63,24 @@ playwright install chromium   # optional, only if system Chrome is unavailable
 python analyzer.py "https://drive.google.com/file/d/FILE_ID/view"
 python analyzer.py "LINK_1" "LINK_2" ...        # multiple links
 python analyzer.py --file links.txt             # one link per line, # comments allowed
+python analyzer.py --force LINK                 # ignore checkpoints, regenerate everything
 ```
+
+### Resumable runs
+
+Every analyzed 15-minute segment is checkpointed to
+`transcripts/{file_id}_digest_segNN.json` as soon as it validates. If a run is
+interrupted (quota limit, crash), re-running the same command digests only the
+segments that are still missing — finished segments cost nothing. The final
+synthesis pass runs once all segments are complete and its output is cached too,
+so a fully cached re-run makes zero LLM calls.
 
 ### Outputs
 
 - `reports/{file_id}_report.md` — the full graded report
 - `reports/{file_id}_report.html` — interactive visual dashboard
 - `transcripts/{file_id}_transcript.txt` — cached transcript (fast re-runs)
+- `transcripts/{file_id}_digest_segNN.json` — per-segment checkpoints (resume)
 
 ## How it works
 

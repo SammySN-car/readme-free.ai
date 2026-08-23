@@ -14,6 +14,12 @@ Usage:
     python analyzer.py "https://drive.google.com/file/d/FILE_ID/view"
     python analyzer.py "LINK_1" "LINK_2"
     python analyzer.py --file links.txt   (one link per line, '#' comments allowed)
+    python analyzer.py --force LINK       (ignore checkpoints/synthesis cache, regenerate all)
+
+Resume behavior:
+    Every analyzed 15-minute segment is checkpointed to disk. Re-running the
+    same command retries ONLY segments that are still missing, so an
+    interrupted or quota-limited run never pays for finished work twice.
 """
 
 import sys
@@ -23,27 +29,14 @@ import os
 import re
 import time
 from transcript_fetcher import fetch_transcript_from_gdrive
-from report_generator import generate_report, LEAK_MARKERS
+from report_generator import generate_report, LEAK_MARKERS, REQUIRED_SECTIONS
 from html_generator import generate_html_report
-from config import GROQ_API_KEYS, REPORTS_DIR, BROWSER_PROFILE_DIR
+from config import GROQ_API_KEYS, REPORTS_DIR, google_profile_ready
 
 
-REQUIRED_HEADERS = [
-    "Executive Summary",
-    "Action Items",
-    "Performance Scorecard",
-    "Topic Competency Matrix",
-    "Key Technical Questions",
-    "Audit Notes",
-    "Chronological",
-]
-
-
-def _auth_profile_ready() -> bool:
-    """True if the user has run `python analyzer.py --login` (browser auth exists)."""
-    return os.path.isdir(BROWSER_PROFILE_DIR) and os.path.exists(
-        os.path.join(BROWSER_PROFILE_DIR, "Default")
-    )
+# The synthesis pass must produce every core section; the chronological
+# chapter log is appended locally by generate_report.
+REQUIRED_HEADERS = REQUIRED_SECTIONS + ["Chronological"]
 
 
 def check_prereqs():
@@ -58,7 +51,7 @@ def check_prereqs():
         print("          Bash:        export GROQ_API_KEYS=\"gsk_...,sk-or-...\"")
         print("        Groq keys:      https://console.groq.com/keys")
         print("        OpenRouter:     https://openrouter.ai/keys")
-    if not _auth_profile_ready():
+    if not google_profile_ready():
         ok = False
         print("[ERROR] No authenticated Google login found. You must log in once")
         print("        before processing any recording:")
@@ -95,7 +88,8 @@ def validate_report(report: str) -> list:
     return warnings
 
 
-def process_single_link(gdrive_url: str, index: int = 1, total: int = 1) -> str:
+def process_single_link(gdrive_url: str, index: int = 1, total: int = 1,
+                        force_refresh: bool = False) -> str:
     """Process a single Google Drive viva recording link end-to-end."""
 
     print(f"\n{'='*60}")
@@ -119,7 +113,8 @@ def process_single_link(gdrive_url: str, index: int = 1, total: int = 1) -> str:
     # Step 2: Generate Markdown report
     report = generate_report(
         transcript_text=transcript_result["text"],
-        file_id=transcript_result["file_id"]
+        file_id=transcript_result["file_id"],
+        force_refresh=force_refresh
     )
 
     # Validate report quality (advisory warnings, never fatal)
@@ -146,7 +141,7 @@ def process_single_link(gdrive_url: str, index: int = 1, total: int = 1) -> str:
     return report
 
 
-def process_links(links: list[str]):
+def process_links(links: list[str], force_refresh: bool = False):
     """Process multiple Google Drive links sequentially."""
 
     print(f"\n{'='*60}")
@@ -161,7 +156,8 @@ def process_links(links: list[str]):
             continue
 
         try:
-            report = process_single_link(link, index=i, total=len(links))
+            report = process_single_link(link, index=i, total=len(links),
+                                         force_refresh=force_refresh)
             if report:
                 results.append({"link": link, "status": "success"})
             else:
@@ -185,6 +181,11 @@ def process_links(links: list[str]):
 
 
 def main():
+    # --force: ignore segment checkpoints + synthesis cache, regenerate everything
+    force_refresh = "--force" in sys.argv[1:]
+    if force_refresh:
+        sys.argv = [a for a in sys.argv if a != "--force"]
+
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
@@ -214,7 +215,7 @@ def main():
         print("\nComplete the setup steps above, then re-run this command.")
         sys.exit(1)
 
-    process_links(links)
+    process_links(links, force_refresh=force_refresh)
 
 
 if __name__ == "__main__":

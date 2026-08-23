@@ -2,16 +2,9 @@ import os
 import json
 import urllib.request
 import xml.etree.ElementTree as ET
-from config import TRANSCRIPTS_DIR, BROWSER_PROFILE_DIR
+from config import TRANSCRIPTS_DIR, google_profile_ready
 from gdrive_downloader import download_from_gdrive, extract_file_id
 from audio_extractor import extract_audio_from_video
-
-
-def _auth_profile_ready() -> bool:
-    """True if the user has run `python analyzer.py --login` (browser auth exists)."""
-    return os.path.isdir(BROWSER_PROFILE_DIR) and os.path.exists(
-        os.path.join(BROWSER_PROFILE_DIR, "Default")
-    )
 
 
 def fetch_transcript_from_gdrive(file_id_or_url: str) -> dict:
@@ -84,7 +77,7 @@ def fetch_transcript_from_gdrive(file_id_or_url: str) -> dict:
     # -------------------------------------------------------------
     # 3. Browser Scraper (authenticated session, only if --login was run)
     # -------------------------------------------------------------
-    if _auth_profile_ready():
+    if google_profile_ready():
         try:
             from browser_scraper import scrape_gdrive_transcript
             scraped_text = scrape_gdrive_transcript(file_id)
@@ -157,10 +150,6 @@ def fetch_transcript_from_gdrive(file_id_or_url: str) -> dict:
     )
     print(hint)
     return {"text": "", "segments": [], "method": "failed", "file_id": file_id}
-
-
-# Alias for backward compatibility
-get_transcript = fetch_transcript_from_gdrive
 
 
 def _try_timedtext_endpoint(file_id: str) -> str:

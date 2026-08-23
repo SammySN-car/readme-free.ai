@@ -1,8 +1,9 @@
 import os
 import re
 import time
+import json
 from groq import Groq
-from config import GROQ_API_KEYS, REPORTS_DIR
+from config import GROQ_API_KEYS, REPORTS_DIR, TRANSCRIPTS_DIR
 import tiktoken
 
 
@@ -53,6 +54,9 @@ TPM_CAP = 8000
 # verbose full report measures ~8.5K chars (~3000 tok), so 3500 gives headroom.
 SYNTH_MAX_TOKENS = 3500
 SYNTH_TOKEN_SAFETY = 300
+# Regeneration tries per truncated synthesis section before falling back to
+# the deterministic salvage trim.
+MAX_SECTION_REPAIR_ATTEMPTS = 3
 
 _ENC = None
 
@@ -703,7 +707,7 @@ def _extract_chapters(text: str, seg_start_sec: int, seg_end_sec: int) -> list:
             end = seg_end_sec
         ch['end'] = end
 
-    return valid
+    return _prune_contained_chapters(valid)
 
 
 def _fmt_range(start_sec, end_sec) -> str:
@@ -835,6 +839,39 @@ def _truncated_ranges(chapters: list) -> list:
     return out
 
 
+def _prune_contained_chapters(chapters: list) -> list:
+    """Drop chapters whose time span lies fully inside another chapter's span.
+
+    Gap-fill can emit a small chapter that a whole-range re-digest also covers;
+    keeping both duplicates content in the proctor log (e.g. an inner
+    'Augmentation question' chapter inside an outer chapter covering the same
+    exchange). When spans are identical, the chapter with the longer body wins.
+    """
+    if len(chapters) < 2:
+        return chapters
+
+    def _score(c):
+        return sum(len(x) for x in c.get('body', []))
+
+    kept = []
+    for c in sorted(chapters, key=lambda x: ((x.get('start') or 0), -(x.get('end') or 0))):
+        cs, ce = (c.get('start') or 0), (c.get('end') or 0)
+        replaced = False
+        drop = False
+        for idx, k in enumerate(kept):
+            ks, ke = (k.get('start') or 0), (k.get('end') or 0)
+            if ks <= cs and ce <= ke:
+                if (ks, ke) == (cs, ce) and _score(c) > _score(k):
+                    kept[idx] = c
+                    replaced = True
+                else:
+                    drop = True
+                break
+        if not replaced and not drop:
+            kept.append(c)
+    return kept
+
+
 def _merge_chapters(primary: list, extra: list, seg_start_sec: int, seg_end_sec: int) -> list:
     """Merge gap-filled chapters into the primary list, dropping overlaps and
     re-validating order/range exactly like _extract_chapters."""
@@ -872,6 +909,56 @@ def _serialize_chapters(chapters: list) -> str:
             block += "\n" + body
         blocks.append(block)
     return "\n\n".join(blocks)
+
+
+# ============================================================
+#  Digest checkpoints — resumable Pass 1 (token-saving)
+#
+#  Each segment's validated chapters are persisted as JSON the
+#  moment they pass validation. Re-running the same link loads
+#  these checkpoints and only re-digests segments that are still
+#  missing, so a crashed/quota-starved run never pays twice.
+#  A missing checkpoint file == "segment not done yet".
+# ============================================================
+
+def _digest_ckpt_path(file_id: str, seg_index: int) -> str:
+    return os.path.join(TRANSCRIPTS_DIR, f"{file_id}_digest_seg{seg_index:02d}.json")
+
+
+def _save_digest(path: str, chapters: list):
+    payload = {
+        "version": 1,
+        "complete": bool(chapters),
+        "chapters": [
+            {"start": c["start"], "end": c["end"], "title": c["title"], "body": list(c["body"])}
+            for c in chapters
+        ],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+
+
+def _load_digest(path: str):
+    """Return the cached chapter list for a segment, or None when absent,
+    invalid, or marked incomplete (so a resume retries that segment)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not payload.get("complete", False):
+            return None
+        chapters = []
+        for c in payload.get("chapters", []):
+            if c.get("start") is None:
+                return None
+            chapters.append({
+                "start": int(c["start"]),
+                "end": int(c["end"]) if c.get("end") is not None else None,
+                "title": str(c.get("title", "")),
+                "body": [str(x) for x in c.get("body", [])],
+            })
+        return chapters if chapters else None
+    except Exception:
+        return None
 
 
 def _condense_chapters_for_synthesis(chapters_text: str, max_tokens: int = 900) -> str:
@@ -947,22 +1034,34 @@ def _ends_abruptly(block_body: str) -> bool:
     return True
 
 
-def _iter_required_section_blocks(text: str):
-    """Yield (name, start, end) spans for every required section present."""
-    for name in REQUIRED_SECTIONS:
-        pattern = re.compile(
-            rf'^##\s*[^\n]*{re.escape(name)}[^\n]*\n.*?(?=^##\s|\Z)',
-            flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
-        )
-        m = pattern.search(text)
-        if m:
-            yield name, m.start(), m.end()
+def _salvage_truncated_block(block_body: str) -> str:
+    """Deterministic, zero-token fallback for a section the LLM keeps cutting
+    off: trim the body back to its last clean line so it never ends
+    mid-sentence. Returns '' when nothing usable remains after the header."""
+    lines = block_body.rstrip().split('\n')
+    while len(lines) > 1:
+        stripped = lines[-1].strip()
+        if not stripped or stripped in ('---', '***', '___'):
+            lines.pop()
+            continue
+        balanced = lines[-1].count('**') % 2 == 0 and lines[-1].count('"') % 2 == 0
+        if balanced and re.search(r'[.!?:;)|]\s*$', stripped):
+            break
+        lines.pop()
+    return '\n'.join(lines).rstrip()
 
 
 def _repair_truncated_sections(router, synthesis_result: str, grounding: str,
                                 synthesis_context: str) -> str:
     """Regenerate any required section whose body was cut off mid-content by the
     output-token cap, replacing it in place with a freshly generated block.
+
+    Escalation per section:
+      1. Up to MAX_SECTION_REPAIR_ATTEMPTS regenerations (the router rotates
+         models/keys between attempts, so each try samples a different engine).
+      2. If every regeneration still comes back truncated, a deterministic
+         salvage pass trims the body to its last complete line — the report
+         then ends cleanly instead of mid-sentence, at zero token cost.
 
     Uses regex-based replacement (not index-based) so repairing one section
     doesn't shift indices for subsequent sections."""
@@ -974,9 +1073,11 @@ def _repair_truncated_sections(router, synthesis_result: str, grounding: str,
         if not _ends_abruptly(body):
             continue
         print(f"    [WARN] '{name}' appears cut off mid-content — regenerating just this section...")
-        time.sleep(CALL_COOLDOWN_SECS)
+        header_line = original_block.split('\n', 1)[0].strip()
         template = (
             f"The '{name}' section in your previous output was CUT OFF mid-content by a length limit.\n\n"
+            f"Use EXACTLY this header as the first line, character-for-character (same emoji, same wording):\n"
+            f"{header_line}\n\n"
             f"Regenerate ONLY the complete '{name}' section, in the exact same Markdown style and with "
             "the exact '## ...' header as the full report. Output ONLY that section — no preamble, no "
             "other sections, no planning text.\n\n"
@@ -985,29 +1086,48 @@ def _repair_truncated_sections(router, synthesis_result: str, grounding: str,
             "GROUNDING EXCERPT:\n{grounding}\n\n"
             "CHAPTER DIGESTS:\n{window_summaries}"
         )
-        prompt, mt = _build_synthesis_call(SYNTHESIS_SYSTEM_PROMPT, template, grounding, synthesis_context)
-        try:
-            fresh = router.call(
-                messages=[
-                    {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=mt,
-                temperature=0.0,
-                allow_tpm_wait=True,
-                is_synthesis=True,
-                raw=True,
+        if name == "Audit Notes":
+            template += (
+                "\nThe section MUST end with this exact closing bullet:\n"
+                "- **Overall Recommendation:** <one-sentence pass/merit/fail verdict grounded in the transcript>.\n"
             )
-        except Exception as exc:
-            print(f"        [WARN] Section repair failed ({str(exc)[:80]}) — keeping original")
-            continue
-        fresh_block = _extract_section_block(fresh, name)
-        fresh_body = fresh_block.split('\n', 1)[1] if '\n' in fresh_block else ''
-        if not fresh_block or _ends_abruptly(fresh_body):
-            print("        [WARN] Regenerated section also incomplete — keeping original")
-            continue
-        synthesis_result = synthesis_result.replace(original_block, fresh_block, 1)
-        print(f"        [OK] '{name}' repaired ({len(fresh_block)} chars)")
+        prompt, mt = _build_synthesis_call(SYNTHESIS_SYSTEM_PROMPT, template, grounding, synthesis_context)
+        fixed_block = None
+        for attempt in range(1, MAX_SECTION_REPAIR_ATTEMPTS + 1):
+            time.sleep(CALL_COOLDOWN_SECS)
+            try:
+                fresh = router.call(
+                    messages=[
+                        {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=mt,
+                    temperature=0.0,
+                    allow_tpm_wait=True,
+                    is_synthesis=True,
+                    raw=True,
+                )
+            except Exception as exc:
+                print(f"        [WARN] Section repair attempt {attempt} failed ({str(exc)[:80]})")
+                break
+            fresh_block = _extract_section_block(fresh, name)
+            fresh_body = fresh_block.split('\n', 1)[1] if '\n' in fresh_block else ''
+            if fresh_block and not _ends_abruptly(fresh_body):
+                fixed_block = fresh_block
+                break
+            if attempt < MAX_SECTION_REPAIR_ATTEMPTS:
+                print(f"        [WARN] Repair attempt {attempt} also incomplete — trying another model...")
+        if fixed_block is None:
+            salvaged_body = _salvage_truncated_block(body)
+            if salvaged_body and salvaged_body != body.rstrip():
+                fixed_block = original_block.split('\n', 1)[0] + '\n' + salvaged_body
+                print(f"        [SALVAGE] '{name}' still incomplete after {MAX_SECTION_REPAIR_ATTEMPTS} "
+                      f"attempts — trimmed to last clean line")
+            else:
+                print(f"        [WARN] '{name}' unrepairable — keeping original")
+                continue
+        synthesis_result = synthesis_result.replace(original_block, fixed_block, 1)
+        print(f"        [OK] '{name}' repaired ({len(fixed_block)} chars)")
     return synthesis_result
 
 
@@ -1050,12 +1170,16 @@ def _build_synthesis_call(system_prompt: str, template: str, grounding: str,
     return prompt, max_tokens
 
 
-def generate_report(transcript_text: str, file_id: str) -> str:
+def generate_report(transcript_text: str, file_id: str, force_refresh: bool = False) -> str:
     """
     Generate a comprehensive multi-candidate Viva Intelligence Report.
-    Pass 1: grounded chronological chapters per 15-min segment (LLM).
+    Pass 1: grounded chronological chapters per 15-min segment (LLM), each
+    checkpointed to disk as soon as it validates — re-runs resume for free.
     Pass 2: synthesis of scorecard, action items, and rubrics, grounded in a
     cleaned transcript excerpt (LLM). Python validates, orders, and stitches.
+
+    force_refresh=True ignores all checkpoints/synthesis cache and regenerates
+    everything (segments still re-checkpoint when they succeed).
     """
     if not GROQ_API_KEYS:
         raise ValueError("No GROQ_API_KEYS configured in config.py!")
@@ -1072,6 +1196,9 @@ def generate_report(transcript_text: str, file_id: str) -> str:
 
     segment_digests = []
     cleaned_segments = []
+    incomplete_segments = []
+    cached_count = 0
+    fresh_count = 0
     for i, s in enumerate(segments, 1):
         print(f"    [Pass 1/2: Segment {i}/{len(segments)}] Auditing [{s['start']} – {s['end']}] ({len(s['text'])} chars)...")
 
@@ -1087,202 +1214,219 @@ def generate_report(transcript_text: str, file_id: str) -> str:
             f"(fillers removed, timestamps preserved):\n\n{cleaned}"
         )
 
-        digest = None
-        try:
-            digest = router.call(
-                messages=[
-                    {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=2200,
-                temperature=0.0,
-                allow_tpm_wait=True,
-                is_synthesis=False
-            )
-        except Exception as e:
-            print(f"        [WARN] Segment {i}: digest call failed ({str(e)[:60]})")
-        chapters = _extract_chapters(digest, seg_start_sec, seg_end_sec) if digest else []
-
-        if not chapters and digest:
-            print(f"    [WARN] Segment {i}: no valid chapters parsed — retrying once...")
-            time.sleep(CALL_COOLDOWN_SECS)
-            retry_prompt = (
-                "You produced no valid chapters. Output the chapters again, starting directly "
-                "with a '### [MM:SS – MM:SS] — Title' header.\n\n"
-                + prompt
-            )
+        # Resume support: reuse saved digests verbatim so finished segments
+        # never cost tokens again. Missing checkpoint == segment not done yet.
+        ckpt_path = _digest_ckpt_path(file_id, i)
+        chapters = None if force_refresh else _load_digest(ckpt_path)
+        used_cache = chapters is not None
+        if used_cache:
+            print(f"        [CACHE] Segment {i}: restored {len(chapters)} chapter(s) from checkpoint")
+        if not used_cache:
+            digest = None
             try:
                 digest = router.call(
                     messages=[
                         {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
-                        {"role": "user", "content": retry_prompt}
+                        {"role": "user", "content": prompt}
                     ],
                     max_tokens=2200,
                     temperature=0.0,
                     allow_tpm_wait=True,
                     is_synthesis=False
                 )
-                chapters = _extract_chapters(digest, seg_start_sec, seg_end_sec)
             except Exception as e:
-                print(f"        [WARN] Segment {i}: retry failed ({str(e)[:60]})")
-                chapters = []
+                print(f"        [WARN] Segment {i}: digest call failed ({str(e)[:60]})")
+            chapters = _extract_chapters(digest, seg_start_sec, seg_end_sec) if digest else []
 
-        # Coverage-based retry: an under-produced digest (early termination,
-        # single chapter) silently drops real Q&A from the proctor log. First
-        # re-digest each uncovered range IN ISOLATION (small focused prompts are
-        # far more reliable), then fall back to a whole-segment re-ask.
-        if chapters:
-            gaps = _segment_gaps(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
-            coverage = _chapter_coverage(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
-            largest_gap = max((e - s for s, e in gaps), default=0)
-            uncovered_dialogue = sum(e - s for s, e in gaps)
-            # A truncated chapter body (digest cut mid-bullet by the token cap)
-            # is content loss even when its time range is technically covered —
-            # e.g. an empty body or a chapter ending '- **Disc'. Re-digest those
-            # ranges in isolation just like uncovered gaps.
-            trunc_ranges = _truncated_ranges(chapters)
-            gaps += [(s, e) for s, e in trunc_ranges if e is not None and e > s]
-            gaps.sort()
-            if trunc_ranges:
-                print(f"        [WARN] Segment {i}: {len(trunc_ranges)} chapter(s) truncated "
-                      f"(digest cut mid-body) — re-digesting in isolation...")
-            # Under-production (model stops early) is the most common silent
-            # failure: chapters legitimately cover what they do cover, but the
-            # last chapter ends long before the segment's actual dialogue does.
-            # Trigger gap-fill when >25% of real dialogue is uncovered, when any
-            # single gap exceeds 3 min, or when the final chapter ends well before
-            # the last dialogue turn. The tail threshold scales with session
-            # length so short recordings (e.g. 7 min) don't lose their closing
-            # remarks (a fixed 90s bound lets ~16% of a short session vanish).
-            last_turn = seg_dialogue[-1][1] if seg_dialogue else seg_end_sec
-            last_chapter_end = max((c['end'] or seg_end_sec) for c in chapters if c['start'] is not None) \
-                if chapters else seg_start_sec
-            tail_miss = last_turn - last_chapter_end
-            seg_duration = max(1, seg_end_sec - seg_start_sec)
-            tail_threshold = max(45, int(seg_duration * 0.12))
-            if gaps and (coverage < 0.75 or largest_gap > 180 or uncovered_dialogue > 120 or tail_miss > tail_threshold or trunc_ranges):
-                print(f"    [WARN] Segment {i}: chapters cover only {coverage:.0%} of dialogue "
-                      f"(largest gap {largest_gap // 60}m{largest_gap % 60:02d}s, "
-                      f"{len(gaps)} uncovered range(s)) — gap-filling...")
+            if not chapters and digest:
+                print(f"    [WARN] Segment {i}: no valid chapters parsed — retrying once...")
                 time.sleep(CALL_COOLDOWN_SECS)
+                retry_prompt = (
+                    "You produced no valid chapters. Output the chapters again, starting directly "
+                    "with a '### [MM:SS – MM:SS] — Title' header.\n\n"
+                    + prompt
+                )
                 try:
-                    extra = []
-                    for gs, ge in gaps:
-                        gap_text = _extract_range_text(s['text'], gs, ge)
-                        if not gap_text.strip():
-                            continue
-                        g_start = f"{gs // 60:02d}:{gs % 60:02d}"
-                        g_end = f"{ge // 60:02d}:{ge % 60:02d}"
-                        gap_prompt = (
-                            f"The chapters below only covered part of the segment. Fill the gap "
-                            f"[{g_start} – {g_end}] with chapters for every question/topic exchange "
-                            f"in that range, using the REAL timestamps from this excerpt. "
-                            f"Start directly with a '### [MM:SS – MM:SS] — Title' header.\n\n"
-                            f"GAP TRANSCRIPT EXCERPT [{g_start} – {g_end}]:\n{gap_text}\n\n"
-                            f"Output ONLY the chapter markdown blocks. Do NOT include any commentary, "
-                            f"reasoning, explanations, or meta-discussion between or after the chapters."
-                        )
-                        digest = router.call(
-                            messages=[
-                                {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
-                                {"role": "user", "content": gap_prompt}
-                            ],
-                            max_tokens=2200,
-                            temperature=0.0,
-                            allow_tpm_wait=True,
-                            is_synthesis=False
-                        )
-                        extra.extend(_extract_chapters(digest, gs, ge))
-                    if extra:
-                        chapters = _merge_chapters(chapters, extra, seg_start_sec, seg_end_sec)
-                        new_cov = _chapter_coverage(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
-                        print(f"        [OK] Segment {i}: {len(chapters)} chapters, "
-                              f"coverage {new_cov:.0%} (gap-filled)")
-                    else:
-                        cover_prompt = (
-                            "Your chapters left large gaps in the segment. You MUST cover the ENTIRE segment, "
-                            "including these currently uncovered ranges: "
-                            + _uncovered_ranges(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
-                            + ". Produce one or more chapters for every question/topic exchange in those ranges, "
-                            "using their real timestamps from the transcript. Start directly with a "
-                            "'### [MM:SS – MM:SS] — Title' header.\n\n"
-                            + prompt
-                        )
-                        digest = router.call(
-                            messages=[
-                                {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
-                                {"role": "user", "content": cover_prompt}
-                            ],
-                            max_tokens=2200,
-                            temperature=0.0,
-                            allow_tpm_wait=True,
-                            is_synthesis=False
-                        )
-                        retry_chapters = _extract_chapters(digest, seg_start_sec, seg_end_sec)
-                        if _chapter_coverage(retry_chapters, seg_start_sec, seg_end_sec, seg_dialogue) > coverage:
-                            chapters = retry_chapters
-                            print(f"        [OK] Segment {i}: {len(chapters)} chapters (coverage improved)")
+                    digest = router.call(
+                        messages=[
+                            {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
+                            {"role": "user", "content": retry_prompt}
+                        ],
+                        max_tokens=2200,
+                        temperature=0.0,
+                        allow_tpm_wait=True,
+                        is_synthesis=False
+                    )
+                    chapters = _extract_chapters(digest, seg_start_sec, seg_end_sec)
                 except Exception as e:
-                    print(f"        [WARN] Segment {i}: coverage retry failed ({str(e)[:60]}) — keeping current chapters")
+                    print(f"        [WARN] Segment {i}: retry failed ({str(e)[:60]})")
+                    chapters = []
 
-            # Post-merge truncation sweep: gap-filled digest output can itself be
-            # cut mid-bullet (it shares the same token cap). Re-digest any range
-            # that still ends truncated, in isolation, so bodies land complete.
-            still_trunc = _truncated_ranges(chapters)
-            if still_trunc:
-                print(f"        [WARN] Segment {i}: {len(still_trunc)} chapter(s) still truncated after "
-                      f"gap-fill — final re-digest...")
-                time.sleep(CALL_COOLDOWN_SECS)
-                try:
-                    extra = []
-                    for gs, ge in still_trunc:
-                        gap_text = _extract_range_text(s['text'], gs, ge)
-                        if not gap_text.strip():
-                            continue
-                        g_start = f"{gs // 60:02d}:{gs % 60:02d}"
-                        g_end = f"{ge // 60:02d}:{ge % 60:02d}"
-                        gap_prompt = (
-                            f"A previous chapter covering [{g_start} – {g_end}] was cut off mid-writing. "
-                            f"Rewrite ONLY that chapter (same title, same range) COMPLETE, with every bullet "
-                            f"fully written and ending in punctuation. Use the REAL timestamps from this "
-                            f"excerpt. Start directly with a '### [MM:SS – MM:SS] — Title' header.\n\n"
-                            f"GAP TRANSCRIPT EXCERPT [{g_start} – {g_end}]:\n{gap_text}\n\n"
-                            f"Output ONLY the chapter markdown block. Do NOT include any commentary, "
-                            f"reasoning, explanations, or meta-discussion."
-                        )
-                        digest = router.call(
-                            messages=[
-                                {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
-                                {"role": "user", "content": gap_prompt}
-                            ],
-                            max_tokens=2200,
-                            temperature=0.0,
-                            allow_tpm_wait=True,
-                            is_synthesis=False
-                        )
-                        extra.extend(_extract_chapters(digest, gs, ge))
-                    if extra:
-                        # Drop the truncated chapters that the fresh re-digest now
-                        # re-covers, so stale cut-off bodies don't linger next to
-                        # their complete replacements.
-                        covered = [(s, e) for s, e in still_trunc]
-                        chapters = [c for c in chapters
-                                    if c['start'] is not None
-                                    and not any(s <= c['start'] and (c['end'] or seg_end_sec) <= e
-                                                for s, e in covered)]
-                        chapters = _merge_chapters(chapters, extra, seg_start_sec, seg_end_sec)
-                        remaining = _truncated_ranges(chapters)
-                        print(f"        [OK] Segment {i}: truncation sweep done, "
-                              f"{len(remaining)} still truncated, {len(chapters)} chapters total")
-                except Exception as e:
-                    print(f"        [WARN] Segment {i}: truncation sweep failed ({str(e)[:60]}) — keeping current chapters")
+            # Coverage-based retry: an under-produced digest (early termination,
+            # single chapter) silently drops real Q&A from the proctor log. First
+            # re-digest each uncovered range IN ISOLATION (small focused prompts are
+            # far more reliable), then fall back to a whole-segment re-ask.
+            if chapters:
+                gaps = _segment_gaps(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
+                coverage = _chapter_coverage(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
+                largest_gap = max((e - s for s, e in gaps), default=0)
+                uncovered_dialogue = sum(e - s for s, e in gaps)
+                # A truncated chapter body (digest cut mid-bullet by the token cap)
+                # is content loss even when its time range is technically covered —
+                # e.g. an empty body or a chapter ending '- **Disc'. Re-digest those
+                # ranges in isolation just like uncovered gaps.
+                trunc_ranges = _truncated_ranges(chapters)
+                gaps += [(s, e) for s, e in trunc_ranges if e is not None and e > s]
+                gaps.sort()
+                if trunc_ranges:
+                    print(f"        [WARN] Segment {i}: {len(trunc_ranges)} chapter(s) truncated "
+                          f"(digest cut mid-body) — re-digesting in isolation...")
+                # Under-production (model stops early) is the most common silent
+                # failure: chapters legitimately cover what they do cover, but the
+                # last chapter ends long before the segment's actual dialogue does.
+                # Trigger gap-fill when >25% of real dialogue is uncovered, when any
+                # single gap exceeds 3 min, or when the final chapter ends well before
+                # the last dialogue turn. The tail threshold scales with session
+                # length so short recordings (e.g. 7 min) don't lose their closing
+                # remarks (a fixed 90s bound lets ~16% of a short session vanish).
+                last_turn = seg_dialogue[-1][1] if seg_dialogue else seg_end_sec
+                last_chapter_end = max((c['end'] or seg_end_sec) for c in chapters if c['start'] is not None) \
+                    if chapters else seg_start_sec
+                tail_miss = last_turn - last_chapter_end
+                seg_duration = max(1, seg_end_sec - seg_start_sec)
+                tail_threshold = max(45, int(seg_duration * 0.12))
+                if gaps and (coverage < 0.75 or largest_gap > 180 or uncovered_dialogue > 120 or tail_miss > tail_threshold or trunc_ranges):
+                    print(f"    [WARN] Segment {i}: chapters cover only {coverage:.0%} of dialogue "
+                          f"(largest gap {largest_gap // 60}m{largest_gap % 60:02d}s, "
+                          f"{len(gaps)} uncovered range(s)) — gap-filling...")
+                    time.sleep(CALL_COOLDOWN_SECS)
+                    try:
+                        extra = []
+                        for gs, ge in gaps:
+                            gap_text = _extract_range_text(s['text'], gs, ge)
+                            if not gap_text.strip():
+                                continue
+                            g_start = f"{gs // 60:02d}:{gs % 60:02d}"
+                            g_end = f"{ge // 60:02d}:{ge % 60:02d}"
+                            gap_prompt = (
+                                f"The chapters below only covered part of the segment. Fill the gap "
+                                f"[{g_start} – {g_end}] with chapters for every question/topic exchange "
+                                f"in that range, using the REAL timestamps from this excerpt. "
+                                f"Start directly with a '### [MM:SS – MM:SS] — Title' header.\n\n"
+                                f"GAP TRANSCRIPT EXCERPT [{g_start} – {g_end}]:\n{gap_text}\n\n"
+                                f"Output ONLY the chapter markdown blocks. Do NOT include any commentary, "
+                                f"reasoning, explanations, or meta-discussion between or after the chapters."
+                            )
+                            digest = router.call(
+                                messages=[
+                                    {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
+                                    {"role": "user", "content": gap_prompt}
+                                ],
+                                max_tokens=2200,
+                                temperature=0.0,
+                                allow_tpm_wait=True,
+                                is_synthesis=False
+                            )
+                            extra.extend(_extract_chapters(digest, gs, ge))
+                        if extra:
+                            chapters = _merge_chapters(chapters, extra, seg_start_sec, seg_end_sec)
+                            new_cov = _chapter_coverage(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
+                            print(f"        [OK] Segment {i}: {len(chapters)} chapters, "
+                                  f"coverage {new_cov:.0%} (gap-filled)")
+                        else:
+                            cover_prompt = (
+                                "Your chapters left large gaps in the segment. You MUST cover the ENTIRE segment, "
+                                "including these currently uncovered ranges: "
+                                + _uncovered_ranges(chapters, seg_start_sec, seg_end_sec, seg_dialogue)
+                                + ". Produce one or more chapters for every question/topic exchange in those ranges, "
+                                "using their real timestamps from the transcript. Start directly with a "
+                                "'### [MM:SS – MM:SS] — Title' header.\n\n"
+                                + prompt
+                            )
+                            digest = router.call(
+                                messages=[
+                                    {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
+                                    {"role": "user", "content": cover_prompt}
+                                ],
+                                max_tokens=2200,
+                                temperature=0.0,
+                                allow_tpm_wait=True,
+                                is_synthesis=False
+                            )
+                            retry_chapters = _extract_chapters(digest, seg_start_sec, seg_end_sec)
+                            if _chapter_coverage(retry_chapters, seg_start_sec, seg_end_sec, seg_dialogue) > coverage:
+                                chapters = retry_chapters
+                                print(f"        [OK] Segment {i}: {len(chapters)} chapters (coverage improved)")
+                    except Exception as e:
+                        print(f"        [WARN] Segment {i}: coverage retry failed ({str(e)[:60]}) — keeping current chapters")
+
+                # Post-merge truncation sweep: gap-filled digest output can itself be
+                # cut mid-bullet (it shares the same token cap). Re-digest any range
+                # that still ends truncated, in isolation, so bodies land complete.
+                still_trunc = _truncated_ranges(chapters)
+                if still_trunc:
+                    print(f"        [WARN] Segment {i}: {len(still_trunc)} chapter(s) still truncated after "
+                          f"gap-fill — final re-digest...")
+                    time.sleep(CALL_COOLDOWN_SECS)
+                    try:
+                        extra = []
+                        for gs, ge in still_trunc:
+                            gap_text = _extract_range_text(s['text'], gs, ge)
+                            if not gap_text.strip():
+                                continue
+                            g_start = f"{gs // 60:02d}:{gs % 60:02d}"
+                            g_end = f"{ge // 60:02d}:{ge % 60:02d}"
+                            gap_prompt = (
+                                f"A previous chapter covering [{g_start} – {g_end}] was cut off mid-writing. "
+                                f"Rewrite ONLY that chapter (same title, same range) COMPLETE, with every bullet "
+                                f"fully written and ending in punctuation. Use the REAL timestamps from this "
+                                f"excerpt. Start directly with a '### [MM:SS – MM:SS] — Title' header.\n\n"
+                                f"GAP TRANSCRIPT EXCERPT [{g_start} – {g_end}]:\n{gap_text}\n\n"
+                                f"Output ONLY the chapter markdown block. Do NOT include any commentary, "
+                                f"reasoning, explanations, or meta-discussion."
+                            )
+                            digest = router.call(
+                                messages=[
+                                    {"role": "system", "content": SEGMENT_SYSTEM_PROMPT},
+                                    {"role": "user", "content": gap_prompt}
+                                ],
+                                max_tokens=2200,
+                                temperature=0.0,
+                                allow_tpm_wait=True,
+                                is_synthesis=False
+                            )
+                            extra.extend(_extract_chapters(digest, gs, ge))
+                        if extra:
+                            # Drop the truncated chapters that the fresh re-digest now
+                            # re-covers, so stale cut-off bodies don't linger next to
+                            # their complete replacements.
+                            covered = [(s, e) for s, e in still_trunc]
+                            chapters = [c for c in chapters
+                                        if c['start'] is not None
+                                        and not any(s <= c['start'] and (c['end'] or seg_end_sec) <= e
+                                                    for s, e in covered)]
+                            chapters = _merge_chapters(chapters, extra, seg_start_sec, seg_end_sec)
+                            remaining = _truncated_ranges(chapters)
+                            print(f"        [OK] Segment {i}: truncation sweep done, "
+                                  f"{len(remaining)} still truncated, {len(chapters)} chapters total")
+                    except Exception as e:
+                        print(f"        [WARN] Segment {i}: truncation sweep failed ({str(e)[:60]}) — keeping current chapters")
 
         if chapters:
+            if not used_cache:
+                _save_digest(ckpt_path, chapters)
+                fresh_count += 1
+            else:
+                cached_count += 1
             segment_digests.append(_serialize_chapters(chapters))
-            print(f"        [OK] Segment {i}: {len(chapters)} chapters in order")
+            src_tag = "CACHE" if used_cache else "FRESH"
+            print(f"        [OK] Segment {i}: {len(chapters)} chapters in order ({src_tag})")
         else:
+            if not used_cache:
+                fresh_count += 1
+            incomplete_segments.append(i)
             fallback = [{
-                'start': seg_start_sec, 'end': seg_end_sec,
+                'start': _ts_to_seconds(s['start']), 'end': _ts_to_seconds(s['end']),
                 'title': f"Segment {i} — [{s['start']} – {s['end']}] (digest unavailable)",
                 'body': [
                     "- **Discussion & Events:** No chapter digest could be generated for this segment "
@@ -1292,158 +1436,192 @@ def generate_report(transcript_text: str, file_id: str) -> str:
                 ],
             }]
             segment_digests.append(_serialize_chapters(fallback))
-            print(f"        [WARN] Segment {i}: still no valid chapters — added placeholder for window continuity")
+            print(f"        [WARN] Segment {i}: still no valid chapters — marked INCOMPLETE; "
+                  f"re-run this same command to retry just this segment")
 
-        if i < len(segments):
+        if i < len(segments) and not used_cache:
             time.sleep(CALL_COOLDOWN_SECS)
 
     merged_chapters = "\n\n---\n\n".join(segment_digests)
 
-    # Step 2: synthesize with token-aware budget sizing
-    print(f"\n    [Pass 2/2: Synthesis] Generating Multi-Candidate Executive Summary, Scorecard & Action Items...")
-    time.sleep(CALL_COOLDOWN_SECS)
+    # ---- Synthesis gating: pay for Pass 2 only when Pass 1 is fully green ----
+    green = len(segments) - len(incomplete_segments)
+    print(f"\n    [CHECKPOINT] Segments complete: {green}/{len(segments)} "
+          f"({cached_count} from cache, {fresh_count} fresh)")
 
-    # The synthesis request is bounded by the free-tier TPM_CAP (a hard 413
-    # past it). Size the GROUNDING EXCERPT and CHAPTER DIGESTS from an ESTIMATED
-    # token budget so ANY transcript length fits.
-    framework_tokens = _budget_tokens(REPORT_SYNTHESIS_PROMPT.format(grounding="", window_summaries=""))
-    content_tokens = TPM_CAP - framework_tokens - SYNTH_MAX_TOKENS - SYNTH_TOKEN_SAFETY - 150
-    if content_tokens < 1200:
-        raise RuntimeError(
-            f"Synthesis request cannot fit under the {TPM_CAP} TPM cap even with minimal inputs "
-            f"(framework uses ~{framework_tokens} tokens).")
+    synthesis_cache_path = os.path.join(REPORTS_DIR, f"{file_id}_synthesis.md")
+    synthesis_result = None
+    skip_synthesis = bool(incomplete_segments)
 
-    grounding_tokens = int(content_tokens * 0.55)
-    condensed_tokens = max(200, content_tokens - grounding_tokens)
-
-    grounding = _build_grounding_context(cleaned_segments, max_tokens=grounding_tokens)
-    synthesis_context = _condense_chapters_for_synthesis(merged_chapters, max_tokens=condensed_tokens)
-    print(f"        Budget: framework ~{framework_tokens} tok | grounding {grounding_tokens} tok | condensed {condensed_tokens} tok")
-
-    synthesis_prompt, synthesis_mt = _build_synthesis_call(
-        SYNTHESIS_SYSTEM_PROMPT, REPORT_SYNTHESIS_PROMPT, grounding, synthesis_context)
-
-    try:
-        synthesis_result = router.call(
-            messages=[
-                {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
-                {"role": "user", "content": synthesis_prompt}
-            ],
-            max_tokens=synthesis_mt,
-            temperature=0.0,
-            allow_tpm_wait=True,
-            is_synthesis=True
-        )
-    except Exception as exc:
-        print(f"    [WARN] Synthesis call failed ({str(exc)[:80]}) — retrying once with reduced grounding...")
-        time.sleep(CALL_COOLDOWN_SECS)
-        reduced_grounding = _build_grounding_context(cleaned_segments, max_tokens=max(300, grounding_tokens // 2))
-        retry_prompt, retry_mt = _build_synthesis_call(
-            SYNTHESIS_SYSTEM_PROMPT, REPORT_SYNTHESIS_PROMPT, reduced_grounding, synthesis_context)
+    if skip_synthesis:
+        missing_ranges = ", ".join(
+            f"[{segments[j - 1]['start']} – {segments[j - 1]['end']}]" for j in incomplete_segments)
+        print(f"\n    [HOLD] Synthesis SKIPPED to save tokens — {len(incomplete_segments)} segment(s) incomplete:")
+        print(f"           {missing_ranges}")
+        print("           Re-run the SAME command: finished segments cost 0 tokens,")
+        print("           missing ones are digested, then the full report auto-assembles.")
+    elif fresh_count == 0 and not force_refresh and os.path.exists(synthesis_cache_path):
         try:
-            synthesis_result = router.call(
-                messages=[
-                    {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
-                    {"role": "user", "content": retry_prompt}
-                ],
-                max_tokens=retry_mt,
-                temperature=0.0,
-                allow_tpm_wait=True,
-                is_synthesis=True
-            )
-        except Exception as exc2:
-            print(f"    [WARN] Synthesis retry failed ({str(exc2)[:80]}) — building report from chapters only")
+            with open(synthesis_cache_path, "r", encoding="utf-8") as _f:
+                synthesis_result = _f.read()
+            print("\n    [Pass 2/2: Synthesis] Reusing cached synthesis — 0 tokens spent")
+        except Exception:
             synthesis_result = None
 
-    if synthesis_result is None:
-        missing = REQUIRED_SECTIONS
-    else:
-        missing = _has_required_sections(synthesis_result)
-        if _has_malformed_table(synthesis_result):
-            print("    [WARN] Synthesis output has a truncated/malformed table row — retrying...")
-            missing = missing + ["complete table rows"]
-        # Repair sections cut off mid-content by the token cap (e.g. the last
-        # numbered question ending mid-sentence). This catches truncation inside
-        # a section that _has_required_sections can't see.
-        synthesis_result = _repair_truncated_sections(
-            router, synthesis_result, grounding, synthesis_context)
-    if missing:
-        print(f"    [WARN] Synthesis missing sections: {', '.join(missing)} — retrying once...")
+    if not skip_synthesis and synthesis_result is None:
+        # Step 2: synthesize with token-aware budget sizing
+        print(f"\n    [Pass 2/2: Synthesis] Generating Multi-Candidate Executive Summary, Scorecard & Action Items...")
         time.sleep(CALL_COOLDOWN_SECS)
-        fix_template = (
-            "Your previous output was incomplete. It is missing these sections: "
-            + ", ".join(missing)
-            + ". Output ONLY the complete report markdown with ALL sections present, "
-            "starting with '## ⚡ Executive Summary (For TAs & Mentors)'. Reuse the grounded content above.\n\n"
-            + REPORT_SYNTHESIS_PROMPT
-        )
-        fix_prompt, fix_mt = _build_synthesis_call(
-            SYNTHESIS_SYSTEM_PROMPT, fix_template, grounding, synthesis_context)
+
+        # The synthesis request is bounded by the free-tier TPM_CAP (a hard 413
+        # past it). Size the GROUNDING EXCERPT and CHAPTER DIGESTS from an ESTIMATED
+        # token budget so ANY transcript length fits.
+        framework_tokens = _budget_tokens(REPORT_SYNTHESIS_PROMPT.format(grounding="", window_summaries=""))
+        content_tokens = TPM_CAP - framework_tokens - SYNTH_MAX_TOKENS - SYNTH_TOKEN_SAFETY - 150
+        if content_tokens < 1200:
+            raise RuntimeError(
+                f"Synthesis request cannot fit under the {TPM_CAP} TPM cap even with minimal inputs "
+                f"(framework uses ~{framework_tokens} tokens).")
+
+        grounding_tokens = int(content_tokens * 0.55)
+        condensed_tokens = max(200, content_tokens - grounding_tokens)
+
+        grounding = _build_grounding_context(cleaned_segments, max_tokens=grounding_tokens)
+        synthesis_context = _condense_chapters_for_synthesis(merged_chapters, max_tokens=condensed_tokens)
+        print(f"        Budget: framework ~{framework_tokens} tok | grounding {grounding_tokens} tok | condensed {condensed_tokens} tok")
+
+        synthesis_prompt, synthesis_mt = _build_synthesis_call(
+            SYNTHESIS_SYSTEM_PROMPT, REPORT_SYNTHESIS_PROMPT, grounding, synthesis_context)
+
         try:
             synthesis_result = router.call(
                 messages=[
                     {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
-                    {"role": "user", "content": fix_prompt}
+                    {"role": "user", "content": synthesis_prompt}
                 ],
-                max_tokens=fix_mt,
+                max_tokens=synthesis_mt,
                 temperature=0.0,
                 allow_tpm_wait=True,
                 is_synthesis=True
             )
         except Exception as exc:
-            print(f"        [WARN] Synthesis retry failed ({exc}) — keeping first-pass output")
+            print(f"    [WARN] Synthesis call failed ({str(exc)[:80]}) — retrying once with reduced grounding...")
+            time.sleep(CALL_COOLDOWN_SECS)
+            reduced_grounding = _build_grounding_context(cleaned_segments, max_tokens=max(300, grounding_tokens // 2))
+            retry_prompt, retry_mt = _build_synthesis_call(
+                SYNTHESIS_SYSTEM_PROMPT, REPORT_SYNTHESIS_PROMPT, reduced_grounding, synthesis_context)
+            try:
+                synthesis_result = router.call(
+                    messages=[
+                        {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+                        {"role": "user", "content": retry_prompt}
+                    ],
+                    max_tokens=retry_mt,
+                    temperature=0.0,
+                    allow_tpm_wait=True,
+                    is_synthesis=True
+                )
+            except Exception as exc2:
+                print(f"    [WARN] Synthesis retry failed ({str(exc2)[:80]}) — building report from chapters only")
+                synthesis_result = None
+
         if synthesis_result is None:
             missing = REQUIRED_SECTIONS
         else:
             missing = _has_required_sections(synthesis_result)
+            if _has_malformed_table(synthesis_result):
+                print("    [WARN] Synthesis output has a truncated/malformed table row — retrying...")
+                missing = missing + ["complete table rows"]
+            # Repair sections cut off mid-content by the token cap (e.g. the last
+            # numbered question ending mid-sentence). This catches truncation inside
+            # a section that _has_required_sections can't see.
+            synthesis_result = _repair_truncated_sections(
+                router, synthesis_result, grounding, synthesis_context)
         if missing:
-            print(f"    [WARN] Synthesis still missing: {', '.join(missing)} — generating missing section(s) directly...")
+            print(f"    [WARN] Synthesis missing sections: {', '.join(missing)} — retrying once...")
             time.sleep(CALL_COOLDOWN_SECS)
-            missing_template = (
-                "The following required report sections are MISSING from your previous output: "
+            fix_template = (
+                "Your previous output was incomplete. It is missing these sections: "
                 + ", ".join(missing)
-                + ".\n\nGenerate ONLY those missing section(s), in the exact same Markdown style and with the "
-                "exact '## ...' headers as the full report. Output ONLY the section(s), nothing else — no "
-                "preamble, no duplicate of existing sections.\n\n"
-                "Use the GROUNDING EXCERPT for exact timestamps/quotes and the CHAPTER DIGESTS for the "
-                "full-session narrative.\n\n"
-                "GROUNDING EXCERPT:\n{grounding}\n\n"
-                "CHAPTER DIGESTS:\n{window_summaries}"
+                + ". Output ONLY the complete report markdown with ALL sections present, "
+                "starting with '## ⚡ Executive Summary (For TAs & Mentors)'. Reuse the grounded content above.\n\n"
+                + REPORT_SYNTHESIS_PROMPT
             )
-            missing_prompt, missing_mt = _build_synthesis_call(
-                SYNTHESIS_SYSTEM_PROMPT, missing_template, grounding, synthesis_context)
+            fix_prompt, fix_mt = _build_synthesis_call(
+                SYNTHESIS_SYSTEM_PROMPT, fix_template, grounding, synthesis_context)
             try:
-                sections = router.call(
+                synthesis_result = router.call(
                     messages=[
                         {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
-                        {"role": "user", "content": missing_prompt}
+                        {"role": "user", "content": fix_prompt}
                     ],
-                    max_tokens=missing_mt,
+                    max_tokens=fix_mt,
                     temperature=0.0,
                     allow_tpm_wait=True,
-                    is_synthesis=True,
-                    raw=True,
+                    is_synthesis=True
                 )
             except Exception as exc:
-                print(f"        [WARN] Missing-section generation failed ({exc}) — skipping")
-                sections = ""
+                print(f"        [WARN] Synthesis retry failed ({exc}) — keeping first-pass output")
             if synthesis_result is None:
-                print(f"    [WARN] Synthesis unavailable — report will be chapters-only")
-            elif not sections.strip():
-                print(f"        [WARN] Missing sections still absent: {', '.join(missing)}")
-                missing = _has_required_sections(synthesis_result)
+                missing = REQUIRED_SECTIONS
             else:
-                # Keep only blocks that correspond to genuinely missing sections.
-                filtered = "\n\n".join(
-                    _extract_section_block(sections, name) for name in REQUIRED_SECTIONS
-                    if name.lower() in sections.lower() and name.lower() not in synthesis_result.lower())
-                if filtered.strip():
-                    synthesis_result = _splice_missing_sections(synthesis_result, filtered)
                 missing = _has_required_sections(synthesis_result)
-                if missing:
-                    print(f"    [WARN] Synthesis still missing: {', '.join(missing)}")
+            if missing:
+                print(f"    [WARN] Synthesis still missing: {', '.join(missing)} — generating missing section(s) directly...")
+                time.sleep(CALL_COOLDOWN_SECS)
+                missing_template = (
+                    "The following required report sections are MISSING from your previous output: "
+                    + ", ".join(missing)
+                    + ".\n\nGenerate ONLY those missing section(s), in the exact same Markdown style and with the "
+                    "exact '## ...' headers as the full report. Output ONLY the section(s), nothing else — no "
+                    "preamble, no duplicate of existing sections.\n\n"
+                    "Use the GROUNDING EXCERPT for exact timestamps/quotes and the CHAPTER DIGESTS for the "
+                    "full-session narrative.\n\n"
+                    "GROUNDING EXCERPT:\n{grounding}\n\n"
+                    "CHAPTER DIGESTS:\n{window_summaries}"
+                )
+                missing_prompt, missing_mt = _build_synthesis_call(
+                    SYNTHESIS_SYSTEM_PROMPT, missing_template, grounding, synthesis_context)
+                try:
+                    sections = router.call(
+                        messages=[
+                            {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+                            {"role": "user", "content": missing_prompt}
+                        ],
+                        max_tokens=missing_mt,
+                        temperature=0.0,
+                        allow_tpm_wait=True,
+                        is_synthesis=True,
+                        raw=True,
+                    )
+                except Exception as exc:
+                    print(f"        [WARN] Missing-section generation failed ({exc}) — skipping")
+                    sections = ""
+                if synthesis_result is None:
+                    print(f"    [WARN] Synthesis unavailable — report will be chapters-only")
+                elif not sections.strip():
+                    print(f"        [WARN] Missing sections still absent: {', '.join(missing)}")
+                    missing = _has_required_sections(synthesis_result)
                 else:
-                    print("        [OK] Missing sections recovered")
+                    # Keep only blocks that correspond to genuinely missing sections.
+                    filtered = "\n\n".join(
+                        _extract_section_block(sections, name) for name in REQUIRED_SECTIONS
+                        if name.lower() in sections.lower() and name.lower() not in synthesis_result.lower())
+                    if filtered.strip():
+                        synthesis_result = _splice_missing_sections(synthesis_result, filtered)
+                    missing = _has_required_sections(synthesis_result)
+                    if missing:
+                        print(f"    [WARN] Synthesis still missing: {', '.join(missing)}")
+                    else:
+                        print("        [OK] Missing sections recovered")
+
+    if synthesis_result is not None:
+        try:
+            with open(synthesis_cache_path, "w", encoding="utf-8") as _f:
+                _f.write(synthesis_result)
+            print("    [Saved] Synthesis cached — future re-runs of unchanged data cost 0 tokens")
+        except Exception as e:
+            print(f"    [WARN] Could not cache synthesis: {e}")
 
     # Step 3: assemble the complete document in Python
     if synthesis_result is None:

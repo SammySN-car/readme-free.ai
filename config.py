@@ -38,7 +38,6 @@ GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
 #  Models
 # ------------------------------------------------------------
 WHISPER_MODEL = "whisper-large-v3"
-LLM_MODEL = "qwen/qwen3.6-27b"
 
 # ------------------------------------------------------------
 #  Directories (runtime data is gitignored)
@@ -52,3 +51,12 @@ BROWSER_PROFILE_DIR = os.path.join(BASE_DIR, "browser_profile")
 
 for d in [DOWNLOADS_DIR, AUDIO_DIR, TRANSCRIPTS_DIR, REPORTS_DIR]:
     os.makedirs(d, exist_ok=True)
+
+
+def google_profile_ready() -> bool:
+    """True if the user has run `python analyzer.py --login` (a Chrome profile
+    with a saved Google session exists). Single source of truth shared by the
+    CLI, transcript fetcher, and browser scraper."""
+    return os.path.isdir(BROWSER_PROFILE_DIR) and os.path.exists(
+        os.path.join(BROWSER_PROFILE_DIR, "Default")
+    )
