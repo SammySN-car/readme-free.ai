@@ -121,7 +121,7 @@ def _clean_chapter_digest(text: str) -> str:
     # or a bolded variant.
     match = re.search(
         r'^#{2,3}\s*(?:\*{1,2}\s*)?(?:chapter\s+\d+\s*[:\-–.]?\s*)?\**\s*'
-        r'[`\[]?\d{1,2}:\d{2}',
+        r'[`\[]?\d{1,3}:\d{2}',
         text, flags=re.MULTILINE | re.IGNORECASE)
     if match:
         return text[match.start():].strip()
@@ -470,7 +470,7 @@ def _split_into_segments(transcript_text: str, segment_minutes: int = 15) -> lis
     # Find the maximum timestamp in the transcript
     max_min = 0
     for line in lines:
-        t_match = re.match(r'\[?(\d{1,2}):(\d{2})\]?', line)
+        t_match = re.match(r'\[?(\d{1,3}):(\d{2})\]?', line)
         if t_match:
             mins = int(t_match.group(1))
             if mins > max_min:
@@ -483,7 +483,7 @@ def _split_into_segments(transcript_text: str, segment_minutes: int = 15) -> lis
     current_start = 0
 
     for line in lines:
-        t_match = re.match(r'\[?(\d{1,2}):(\d{2})\]?', line)
+        t_match = re.match(r'\[?(\d{1,3}):(\d{2})\]?', line)
         if t_match:
             mins = int(t_match.group(1))
             seg_start = (mins // segment_minutes) * segment_minutes
@@ -516,7 +516,7 @@ _FILLER_PREFIX = re.compile(
     r'^(?:uh|um|umm|uhh|uhm|ah|hmm|mm|eh|er|erm|like)\b[\s,.\-–—]*',
     flags=re.IGNORECASE,
 )
-_TURN_RE = re.compile(r'^(\[[^\[\]]*\d{1,2}:\d{2}[^\[\]]*\])\s*(.*)$')
+_TURN_RE = re.compile(r'^(\[[^\[\]]*\d{1,3}:\d{2}[^\[\]]*\])\s*(.*)$')
 
 
 def _clean_segment_text(text: str) -> str:
@@ -553,7 +553,7 @@ def _ts_to_seconds(ts: str) -> int:
 
 
 def _line_start_seconds(line: str) -> int:
-    m = re.match(r'\[(\d{1,2}):(\d{2})', line)
+    m = re.match(r'\[(\d{1,3}):(\d{2})', line)
     if m:
         return int(m.group(1)) * 60 + int(m.group(2))
     return 0
@@ -625,8 +625,8 @@ def _build_grounding_context(cleaned_segments: list, max_tokens: int = 1100) -> 
 
 _CHAPTER_HEADER_RE = re.compile(
     r'^#{3}\s*(?:\*{1,2}\s*)?(?:chapter\s+\d+\s*[:\-–.]?\s*)?\**\s*'
-    r'[`\[]?(\d{1,2}:\d{2})'
-    r'(?:\s*[-–]?\s*(\d{1,2}:\d{2}))?[`\]]?\s*[-—–]?\s*(.*)$',
+    r'[`\[]?(\d{1,3}:\d{2})'
+    r'(?:\s*[-–]?\s*(\d{1,3}:\d{2}))?[`\]]?\s*[-—–]?\s*(.*)$',
     flags=re.MULTILINE | re.IGNORECASE,
 )
 
@@ -638,7 +638,7 @@ def _parse_chapter_range(header: str) -> tuple:
     prefix (e.g. '[00:00 – 15:00] — 00:48] — Title'): the last two times are
     used when ascending, otherwise the final time is treated as the start.
     """
-    times = [_ts_to_seconds(x) for x in re.findall(r'\d{1,2}:\d{2}', header)]
+    times = [_ts_to_seconds(x) for x in re.findall(r'\d{1,3}:\d{2}', header)]
     if not times:
         return None, None
     if len(times) == 1:
@@ -666,7 +666,7 @@ def _extract_chapters(text: str, seg_start_sec: int, seg_end_sec: int) -> list:
             title = m.group(3).strip()
             # strip a stray window-prefix timestamp fragment from the title,
             # e.g. '00:48] — ID Verification' -> 'ID Verification'
-            title = re.sub(r'^[\[`\]]?\s*\d{1,2}:\d{2}\s*[\]–—-]?\s*[-—–]?\s*', '', title).strip()
+            title = re.sub(r'^[\[`\]]?\s*\d{1,3}:\d{2}\s*[\]–—-]?\s*[-—–]?\s*', '', title).strip()
             start, end = _parse_chapter_range(m.group(0))
             cur = {'start': start, 'end': end, 'title': title, 'body': []}
         else:
@@ -729,7 +729,7 @@ def _dialogue_ranges(segment_text: str, gap_sec: int = 15) -> list:
     """
     ts = []
     for ln in segment_text.split('\n'):
-        m = re.match(r'^\s*\[?(\d{1,2}):(\d{2})', ln)
+        m = re.match(r'^\s*\[?(\d{1,3}):(\d{2})', ln)
         if m:
             ts.append(int(m.group(1)) * 60 + int(m.group(2)))
     ts.sort()
@@ -802,7 +802,7 @@ def _extract_range_text(segment_text: str, start_sec: int, end_sec: int) -> str:
     [start_sec, end_sec), so a gap can be re-digested in isolation."""
     out = []
     for ln in segment_text.split('\n'):
-        m = re.match(r'^\s*\[(\d{1,2}):(\d{2})', ln)
+        m = re.match(r'^\s*\[(\d{1,3}):(\d{2})', ln)
         if not m:
             continue
         t = int(m.group(1)) * 60 + int(m.group(2))

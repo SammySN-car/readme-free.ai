@@ -78,13 +78,3 @@ def extract_audio(video_path: str, output_filename: str = None) -> str:
 
 # Alias for backward compatibility
 extract_audio_from_video = extract_audio
-
-
-# --- Quick standalone test ---
-if __name__ == "__main__":
-    test_path = input("Enter path to an .mp4 file: ").strip().strip('"')
-    if test_path and os.path.exists(test_path):
-        audio = extract_audio(test_path)
-        print(f"\nExtracted audio: {audio}")
-    else:
-        print("File not found.")

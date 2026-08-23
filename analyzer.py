@@ -78,7 +78,7 @@ def validate_report(report: str) -> list:
         warnings.append(f"prompt/instruction leakage detected: {', '.join(leaked)}")
 
     chapter_times = []
-    for m in re.finditer(r'^###\s*[`\[]?(\d{1,2}):(\d{2})', report, flags=re.MULTILINE):
+    for m in re.finditer(r'^###\s*[`\[]?(\d{1,3}):(\d{2})', report, flags=re.MULTILINE):
         chapter_times.append(int(m.group(1)) * 60 + int(m.group(2)))
     if len(chapter_times) > 1:
         out_of_order = sum(1 for a, b in zip(chapter_times, chapter_times[1:]) if b < a)

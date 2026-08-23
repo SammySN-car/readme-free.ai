@@ -739,7 +739,7 @@ def _render_transcript_section(transcript_text: str, file_id: str) -> str:
     lines = [l.strip() for l in transcript_text.split('\n') if l.strip() and not l.startswith('#') and not l.startswith('===')]
 
     for line in lines:
-        t_match = re.match(r'\[?(\d{1,2}:\d{2})\]?\s*(.*)', line)
+        t_match = re.match(r'\[?(\d{1,3}:\d{2})\]?\s*(.*)', line)
         if t_match:
             timestamp = t_match.group(1)
             content = t_match.group(2)
