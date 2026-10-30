@@ -1,3 +1,4 @@
+"""Makes the operating system module available. This allows the module to interact with the underlying operating system environment. It provides access to functions related to file paths and directories."""
 import os
 import time
 import urllib.parse
