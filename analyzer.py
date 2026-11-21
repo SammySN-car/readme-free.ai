@@ -182,6 +182,7 @@ def process_links(links: list[str], force_refresh: bool = False):
 
 def main():
     # --force: ignore segment checkpoints + synthesis cache, regenerate everything
+    """Processes command-line arguments, allowing for forced refreshes, one-time login authentication, or reading links from a specified file. It validates prerequisites and then collects the list of links. Finally, it calls process_links using the collected links and the determined refresh status."""
     force_refresh = "--force" in sys.argv[1:]
     if force_refresh:
         sys.argv = [a for a in sys.argv if a != "--force"]
